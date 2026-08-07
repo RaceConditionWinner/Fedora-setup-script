@@ -3,37 +3,39 @@ set -Eeuo pipefail
 
 ###############################################################################
 # Fedora KDE post-install / maintenance setup
+# - Run as the normal desktop user (not with sudo)
 # - Designed to be safe to rerun
-# - Requests sudo password once at startup
-# - Keeps sudo credentials alive for the duration of the script
+# - Preserves the personalized package/configuration choices in this setup
 ###############################################################################
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly REAL_USER="${SUDO_USER:-$USER}"
+readonly REAL_USER="$(id -un)"
 readonly REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+readonly FEDORA_VERSION="$(rpm -E %fedora)"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-if [[ $EUID -eq 0 ]]; then
-    die "Run this script as your normal user, not with sudo. It will request sudo once itself."
+if (( EUID == 0 )); then
+    die "Run $SCRIPT_NAME as your normal user, not with sudo. It requests sudo itself."
 fi
 
+[[ -n "$REAL_HOME" && -d "$REAL_HOME" ]] || die "Could not determine the home directory for $REAL_USER."
 command -v sudo >/dev/null 2>&1 || die "sudo is not installed."
+command -v dnf  >/dev/null 2>&1 || die "dnf is not installed."
+command -v rpm  >/dev/null 2>&1 || die "rpm is not installed."
 
 ###############################################################################
-# Sudo authentication: prompt once, then keep timestamp alive
+# Sudo authentication
 ###############################################################################
 log "Authenticating administrator access"
 sudo -v
 
-# Refresh the sudo timestamp periodically so long downloads/installs do not
-# cause another password prompt later in the script.
+# Keep the sudo timestamp alive during long downloads/transactions.
 (
-    while true; do
-        sudo -n -v >/dev/null 2>&1 || exit
+    while sudo -n -v >/dev/null 2>&1; do
         sleep 45
     done
 ) &
@@ -48,7 +50,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ###############################################################################
-# 1. Remove unwanted applications
+# 1. Remove unwanted Fedora/KDE applications
 ###############################################################################
 log "Removing unwanted Fedora/KDE applications"
 
@@ -64,96 +66,144 @@ UNWANTED_PACKAGES=(
     neochat
 )
 
-# DNF safely ignores package names/patterns that are not installed.
-sudo dnf remove -y "${UNWANTED_PACKAGES[@]}" || \
-    warn "Some requested packages were already absent or could not be removed."
+# --skip-unavailable makes reruns tolerant of packages/specs that are absent.
+sudo dnf remove -y  "${UNWANTED_PACKAGES[@]}" || \
+    warn "Some requested packages could not be removed; continuing."
 
 ###############################################################################
-# 2. Cleanup and update
+# 2. Fully update the Fedora base before adding third-party repositories
 ###############################################################################
-log "Cleaning unused packages"
-sudo dnf autoremove -y || warn "dnf autoremove reported a non-fatal issue."
-
 log "Refreshing repositories and upgrading Fedora"
-sudo dnf clean all
-sudo dnf upgrade --refresh -y
+# --refresh is sufficient; 'dnf clean all' here would only force a full metadata
+# redownload and make the next transaction slower.
+sudo dnf --refresh upgrade -y
 
 ###############################################################################
-# 3. RPM Fusion
+# 3. RPM Fusion repositories
 ###############################################################################
 log "Ensuring RPM Fusion repositories are installed"
 
-FEDORA_VERSION="$(rpm -E %fedora)"
+RPMFUSION_RPMS=()
+rpm -q rpmfusion-free-release >/dev/null 2>&1 || \
+    RPMFUSION_RPMS+=("https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VERSION}.noarch.rpm")
+rpm -q rpmfusion-nonfree-release >/dev/null 2>&1 || \
+    RPMFUSION_RPMS+=("https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VERSION}.noarch.rpm")
 
-if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
-    sudo dnf install -y \
-        "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VERSION}.noarch.rpm"
+if ((${#RPMFUSION_RPMS[@]})); then
+    sudo dnf install -y "${RPMFUSION_RPMS[@]}"
 else
-    ok "RPM Fusion Free already installed."
-fi
-
-if ! rpm -q rpmfusion-nonfree-release >/dev/null 2>&1; then
-    sudo dnf install -y \
-        "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VERSION}.noarch.rpm"
-else
-    ok "RPM Fusion Nonfree already installed."
+    ok "RPM Fusion Free and Nonfree are already installed."
 fi
 
 ###############################################################################
-# 4. Multimedia
+# 4. Microsoft VS Code repository
 ###############################################################################
-log "Installing multimedia support"
+log "Ensuring the Visual Studio Code repository is configured"
 
-sudo dnf group install -y --with-optional multimedia || \
-    warn "Multimedia group installation reported a non-fatal issue."
+if [[ ! -f /etc/yum.repos.d/vscode.repo ]]; then
+    # This is Microsoft's current documented RPM-repository configuration.
+    sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+    sudo tee /etc/yum.repos.d/vscode.repo >/dev/null <<'EOF_REPO'
+[code]
+name=Visual Studio Code
+baseurl=https://packages.microsoft.com/yumrepos/vscode
+enabled=1
+autorefresh=1
+type=rpm-md
+gpgcheck=1
+gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+EOF_REPO
+else
+    ok "Visual Studio Code repository already configured."
+fi
 
-# Only swap when Fedora's ffmpeg-free is actually installed.
-if rpm -q ffmpeg-free >/dev/null 2>&1; then
+###############################################################################
+# 5. Vivaldi Stable repository
+###############################################################################
+log "Ensuring the official Vivaldi Stable repository is configured"
+
+VIVALDI_REPO_FILE="/etc/yum.repos.d/vivaldi-fedora.repo"
+
+if [[ ! -f "$VIVALDI_REPO_FILE" ]]; then
+    # Vivaldi's official Fedora repository definition. Download first, then
+    # install atomically so a failed transfer cannot leave a partial repo file.
+    VIVALDI_REPO_TMP="$(mktemp)"
+    if curl -fL --retry 3 --retry-delay 2 \
+        https://repo.vivaldi.com/archive/vivaldi-fedora.repo \
+        -o "$VIVALDI_REPO_TMP"; then
+        sudo install -m 0644 "$VIVALDI_REPO_TMP" "$VIVALDI_REPO_FILE"
+        rm -f -- "$VIVALDI_REPO_TMP"
+    else
+        rm -f -- "$VIVALDI_REPO_TMP"
+        die "Could not download the official Vivaldi Fedora repository configuration."
+    fi
+else
+    ok "Vivaldi repository already configured."
+fi
+
+###############################################################################
+# 7. Base packages and utilities
+###############################################################################
+log "Installing shell, development, multimedia, and firmware utilities"
+
+# Keep compatible installs in one DNF transaction.
+sudo dnf install -y \
+    zsh git curl util-linux-user \
+    libva-utils vulkan-tools efibootmgr \
+    rsms-inter-fonts jetbrains-mono-fonts \
+    code vivaldi-stable telegram-desktop vlc
+
+###############################################################################
+# 7. Multimedia codecs
+###############################################################################
+log "Installing full multimedia codec support"
+
+# Fedora ships the restricted ffmpeg-free build. Replace it with RPM Fusion's
+# full FFmpeg build first so the rest of the multimedia stack resolves cleanly.
+if rpm -q ffmpeg >/dev/null 2>&1; then
+    ok "RPM Fusion ffmpeg is already installed."
+elif rpm -q ffmpeg-free >/dev/null 2>&1; then
     sudo dnf swap -y ffmpeg-free ffmpeg --allowerasing
-elif rpm -q ffmpeg >/dev/null 2>&1; then
-    ok "Full ffmpeg is already installed."
 else
     sudo dnf install -y ffmpeg
 fi
 
-sudo dnf upgrade -y @multimedia \
-    --setopt=install_weak_deps=False \
-    --exclude=PackageKit-gstreamer-plugin || \
-    warn "Multimedia group upgrade reported a non-fatal issue."
-
-sudo dnf group install -y sound-and-video || \
-    warn "sound-and-video group installation reported a non-fatal issue."
-
-sudo dnf install -y ffmpeg-libs libva libva-utils
-
-###############################################################################
-# 5. Mesa hardware acceleration
-###############################################################################
-log "Configuring RPM Fusion Mesa hardware acceleration"
-
-swap_if_installed() {
-    local from="$1"
-    local to="$2"
-
-    if rpm -q "$from" >/dev/null 2>&1; then
-        sudo dnf swap -y "$from" "$to" || \
-            warn "Could not swap $from -> $to."
-    fi
-}
-
-swap_if_installed mesa-va-drivers mesa-va-drivers-freeworld
-swap_if_installed mesa-vdpau-drivers mesa-vdpau-drivers-freeworld
-swap_if_installed mesa-va-drivers.i686 mesa-va-drivers-freeworld.i686
-swap_if_installed mesa-vdpau-drivers.i686 mesa-vdpau-drivers-freeworld.i686
+# Install the useful GStreamer/desktop codec stack explicitly. This avoids
+# relying on third-party additions to the Multimedia group, which has had
+# inconsistent behavior with DNF5, while still covering KDE/Qt/GStreamer apps.
+sudo dnf install -y --setopt=install_weak_deps=False \
+    gstreamer1-plugins-good \
+    gstreamer1-plugins-bad-free \
+    gstreamer1-plugins-bad-free-extras \
+    gstreamer1-plugins-bad-freeworld \
+    gstreamer1-plugins-ugly \
+    gstreamer1-plugins-ugly-free \
+    gstreamer1-plugin-libav \
+    gstreamer1-plugin-openh264 \
+    pipewire-codec-aptx \
+    lame-libs
 
 ###############################################################################
-# 6. Base development / shell packages
+# 8. AMD hardware video acceleration
 ###############################################################################
-log "Installing Zsh, Git, curl, and utilities"
-sudo dnf install -y zsh git curl util-linux-user
+log "Configuring AMD hardware video acceleration"
+
+if rpm -q mesa-va-drivers-freeworld >/dev/null 2>&1; then
+    ok "Mesa VA-API freeworld drivers are already installed."
+elif rpm -q mesa-va-drivers >/dev/null 2>&1; then
+    sudo dnf swap -y mesa-va-drivers mesa-va-drivers-freeworld --allowerasing
+else
+    sudo dnf install -y mesa-va-drivers-freeworld
+fi
+
+# Quick sanity checks; these do not alter configuration.
+command -v ffmpeg >/dev/null 2>&1 && ok "FFmpeg is available." || \
+    warn "FFmpeg is unavailable after multimedia setup."
+command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostics are available." || \
+    warn "vainfo is unavailable after multimedia setup."
 
 ###############################################################################
-# 7. Oh My Zsh
+# 9. Oh My Zsh and plugins
 ###############################################################################
 log "Installing/updating Oh My Zsh"
 
@@ -162,17 +212,17 @@ ZSHRC="$REAL_HOME/.zshrc"
 ZSH_CUSTOM="$OMZ_DIR/custom"
 
 if [[ -d "$OMZ_DIR/.git" ]]; then
-    git -C "$OMZ_DIR" pull --ff-only || warn "Could not update Oh My Zsh; keeping current installation."
+    git -C "$OMZ_DIR" pull --ff-only || \
+        warn "Could not update Oh My Zsh; keeping the current installation."
 else
-    # Preserve an unrelated broken/partial directory rather than deleting user data.
     if [[ -e "$OMZ_DIR" ]]; then
         backup="${OMZ_DIR}.backup.$(date +%Y%m%d-%H%M%S)"
-        mv "$OMZ_DIR" "$backup"
+        mv -- "$OMZ_DIR" "$backup"
         warn "Existing non-Git Oh My Zsh directory moved to $backup"
     fi
 
-    RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
-        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+    # Clone the project directly instead of executing a network-fetched installer.
+    git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$OMZ_DIR"
 fi
 
 mkdir -p "$ZSH_CUSTOM/plugins"
@@ -182,7 +232,8 @@ install_or_update_plugin() {
     local dir="$2"
 
     if [[ -d "$dir/.git" ]]; then
-        git -C "$dir" pull --ff-only || warn "Could not update ${dir##*/}; keeping current version."
+        git -C "$dir" pull --ff-only || \
+            warn "Could not update ${dir##*/}; keeping the current version."
     elif [[ -e "$dir" ]]; then
         warn "$dir exists but is not a Git checkout; leaving it unchanged."
     else
@@ -194,18 +245,22 @@ log "Installing/updating Zsh plugins"
 install_or_update_plugin \
     https://github.com/zsh-users/zsh-autosuggestions \
     "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
-
 install_or_update_plugin \
     https://github.com/zsh-users/zsh-syntax-highlighting \
     "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
-
 install_or_update_plugin \
     https://github.com/zsh-users/zsh-completions \
     "$ZSH_CUSTOM/plugins/zsh-completions"
 
 log "Configuring Zsh"
 
-touch "$ZSHRC"
+# On a fresh install, seed .zshrc from the upstream template. Existing user
+# configuration is preserved and then normalized below.
+if [[ ! -e "$ZSHRC" ]]; then
+    cp "$OMZ_DIR/templates/zshrc.zsh-template" "$ZSHRC"
+else
+    touch "$ZSHRC"
+fi
 
 if grep -q '^ZSH_THEME=' "$ZSHRC"; then
     sed -i 's/^ZSH_THEME=.*/ZSH_THEME="robbyrussell"/' "$ZSHRC"
@@ -219,52 +274,34 @@ else
     printf '\nplugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting zsh-completions)\n' >> "$ZSHRC"
 fi
 
-# Remove stale Powerlevel10k configuration from the requested setup.
-sed -i '/p10k/d; /POWERLEVEL9K/d' "$ZSHRC"
-rm -f "$REAL_HOME/.p10k.zsh"
-rm -rf "$ZSH_CUSTOM/themes/powerlevel10k"
+# Ensure an existing custom .zshrc actually loads this Oh My Zsh checkout.
+if ! grep -Eq '^[[:space:]]*(source|\.)[[:space:]]+.*oh-my-zsh\.sh' "$ZSHRC"; then
+    cat >> "$ZSHRC" <<'EOF_OMZ'
 
-###############################################################################
-# 8. Visual Studio Code
-###############################################################################
-log "Installing Visual Studio Code"
-
-if [[ ! -f /etc/yum.repos.d/vscode.repo ]]; then
-    sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
-
-    sudo tee /etc/yum.repos.d/vscode.repo >/dev/null <<'EOF'
-[code]
-name=Visual Studio Code
-baseurl=https://packages.microsoft.com/yumrepos/vscode
-enabled=1
-autorefresh=1
-type=rpm-md
-gpgcheck=1
-gpgkey=https://packages.microsoft.com/keys/microsoft.asc
-EOF
-fi
-
-if rpm -q code >/dev/null 2>&1; then
-    ok "Visual Studio Code already installed."
-else
-    sudo dnf install -y code
+# BEGIN FEDORA-SETUP OH-MY-ZSH
+export ZSH="$HOME/.oh-my-zsh"
+source "$ZSH/oh-my-zsh.sh"
+# END FEDORA-SETUP OH-MY-ZSH
+EOF_OMZ
 fi
 
 ###############################################################################
-# 9. VS Code editor configuration
+# 10. VS Code editor configuration
 ###############################################################################
 log "Configuring VS Code as the default text editor"
 
 if command -v gio >/dev/null 2>&1; then
     gio mime text/plain code.desktop || warn "Could not set text/plain MIME default."
+else
+    warn "gio is unavailable; skipping the text/plain MIME association."
 fi
 
-# Idempotent managed block: remove previous copy, then add exactly one.
+# Idempotent managed block: remove the previous copy and add exactly one.
 sed -i \
     '/# BEGIN FEDORA-SETUP EDITOR/,/# END FEDORA-SETUP EDITOR/d' \
     "$ZSHRC"
 
-cat >> "$ZSHRC" <<'EOF'
+cat >> "$ZSHRC" <<'EOF_EDITOR'
 
 # BEGIN FEDORA-SETUP EDITOR
 export EDITOR='code --wait'
@@ -274,85 +311,108 @@ nano() {
     command code --wait "$@"
 }
 # END FEDORA-SETUP EDITOR
-EOF
+EOF_EDITOR
 
 ###############################################################################
-# 10. NumLock
+# 11. KDE fonts
 ###############################################################################
-log "Enabling NumLock for KDE and Plasma Login"
+log "Configuring Inter for KDE and JetBrains Mono for monospace/terminal text"
+
+if command -v kwriteconfig6 >/dev/null 2>&1; then
+    # Qt/KDE font serialization: family,size,...,weight,...
+    KDE_UI_FONT='Inter,10,-1,5,50,0,0,0,0,0'
+    KDE_SMALL_FONT='Inter,8,-1,5,50,0,0,0,0,0'
+    KDE_MONO_FONT='JetBrains Mono,10,-1,5,50,0,0,0,0,0'
+
+    kwriteconfig6 --file kdeglobals --group General --key font "$KDE_UI_FONT"
+    kwriteconfig6 --file kdeglobals --group General --key menuFont "$KDE_UI_FONT"
+    kwriteconfig6 --file kdeglobals --group General --key toolBarFont "$KDE_UI_FONT"
+    kwriteconfig6 --file kdeglobals --group General --key smallestReadableFont "$KDE_SMALL_FONT"
+    kwriteconfig6 --file kdeglobals --group General --key fixed "$KDE_MONO_FONT"
+    kwriteconfig6 --file kdeglobals --group WM --key activeFont "$KDE_UI_FONT"
+
+    ok "KDE fonts set to Inter; fixed-width font set to JetBrains Mono."
+else
+    warn "kwriteconfig6 not found; skipping KDE font configuration."
+fi
+
+###############################################################################
+# 12. NumLock: Plasma session and Plasma Login Manager
+###############################################################################
+log "Enabling NumLock for KDE Plasma and Plasma Login Manager"
 
 if command -v kwriteconfig6 >/dev/null 2>&1; then
     kwriteconfig6 --file kcminputrc --group Keyboard --key NumLock 0
 else
-    warn "kwriteconfig6 not found; skipping per-user KDE NumLock setting."
+    warn "kwriteconfig6 not found; skipping the per-user Plasma NumLock setting."
 fi
 
-sudo tee /etc/plasmalogin.conf >/dev/null <<'EOF'
+if systemctl list-unit-files plasmalogin.service --no-legend 2>/dev/null | grep -q '^plasmalogin\.service'; then
+    # Fedora 44+ KDE fresh installs use Plasma Login Manager by default.
+    sudo tee /etc/plasmalogin.conf >/dev/null <<'EOF_PLM'
 [General]
 Numlock=on
-EOF
+EOF_PLM
 
-sudo mkdir -p /var/lib/plasmalogin/.config/kdedefaults
-sudo tee /var/lib/plasmalogin/.config/kdedefaults/kcminputrc >/dev/null <<'EOF'
+    sudo install -d -m 0755 /var/lib/plasmalogin/.config/kdedefaults
+    sudo tee /var/lib/plasmalogin/.config/kdedefaults/kcminputrc >/dev/null <<'EOF_PLM_KBD'
 [Keyboard]
 NumLock=0
-EOF
+EOF_PLM_KBD
+
+    if getent passwd plasmalogin >/dev/null 2>&1; then
+        sudo chown -R plasmalogin:plasmalogin /var/lib/plasmalogin/.config
+    fi
+else
+    warn "Plasma Login Manager is not installed; login-screen NumLock configuration was skipped."
+fi
 
 ###############################################################################
-# 11. KDE cache and system tweaks
+# 12. KDE/system tweaks
 ###############################################################################
 log "Applying KDE/system tweaks"
 
 if command -v kbuildsycoca6 >/dev/null 2>&1; then
-    # Some third-party .desktop files can emit harmless parser warnings here.
-    # Cache rebuild failure should not abort the entire setup.
     kbuildsycoca6 --noincremental || \
-        warn "KDE cache rebuild reported a warning/error."
+        warn "KDE cache rebuild reported a non-fatal warning/error."
 fi
 
+# Fedora enables fstrim.timer by default, but this preserves the requested
+# behavior and repairs it if it has been disabled locally.
 sudo systemctl enable fstrim.timer >/dev/null 2>&1 || \
     warn "Could not enable fstrim.timer."
 
 sudo timedatectl set-local-rtc 0 || \
-    warn "Could not set RTC to UTC."
+    warn "Could not configure the hardware clock to use UTC."
 
-sudo systemctl disable NetworkManager-wait-online.service >/dev/null 2>&1 || true
-sudo rm -f /etc/xdg/autostart/org.gnome.Software.desktop
+# Intentional boot optimization. Systems with remote mounts/services that truly
+# require network-online.target should leave this service enabled.
+sudo systemctl disable NetworkManager-wait-online.service >/dev/null 2>&1 || \
+    warn "Could not disable NetworkManager-wait-online.service."
+
+# Preserve the original customization, but only remove the file if present.
+sudo rm -f -- /etc/xdg/autostart/org.gnome.Software.desktop
 
 ###############################################################################
-# 12. Journal limits
+# 14. systemd journal limits
 ###############################################################################
 log "Configuring systemd journal limits"
 
-sudo mkdir -p /etc/systemd/journald.conf.d
-sudo tee /etc/systemd/journald.conf.d/limits.conf >/dev/null <<'EOF'
+sudo install -d -m 0755 /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/limits.conf >/dev/null <<'EOF_JOURNAL'
 [Journal]
 SystemMaxUse=200M
 SystemMaxFileSize=50M
-EOF
+EOF_JOURNAL
 
 sudo systemctl restart systemd-journald
 
 ###############################################################################
-# 13. Maintenance
-###############################################################################
-log "Running maintenance"
-
-sudo journalctl --vacuum-time=7d || warn "Journal vacuum reported a non-fatal issue."
-
-if command -v flatpak >/dev/null 2>&1; then
-    flatpak uninstall --unused -y || warn "Flatpak cleanup reported a non-fatal issue."
-fi
-
-sudo fstrim -av || warn "Manual fstrim reported a non-fatal issue."
-
-###############################################################################
-# 14. UEFI BootOrder
+# 15. UEFI BootOrder
 ###############################################################################
 log "Checking UEFI boot order"
 
-if command -v efibootmgr >/dev/null 2>&1; then
-    # Preserve the original behavior: select the first Windows Boot Manager.
+if [[ -d /sys/firmware/efi/efivars ]]; then
     WIN="$(
         efibootmgr | awk '/Windows Boot Manager/ {
             gsub(/\*/, "", $1)
@@ -362,14 +422,14 @@ if command -v efibootmgr >/dev/null 2>&1; then
         }'
     )"
 
-    if [[ -n "${WIN:-}" ]]; then
+    if [[ -n "$WIN" ]]; then
         ORDER="$(efibootmgr | awk -F'BootOrder: ' '/BootOrder/ {print $2; exit}')"
 
-        if [[ -n "${ORDER:-}" ]]; then
+        if [[ -n "$ORDER" ]]; then
             NEW_ORDER="$(
                 printf '%s\n' "$ORDER" |
                     tr ',' '\n' |
-                    grep -v "^${WIN}$" |
+                    awk -v win="$WIN" '$0 != win' |
                     paste -sd, -
             )"
 
@@ -379,21 +439,21 @@ if command -v efibootmgr >/dev/null 2>&1; then
             if [[ "$ORDER" == "$FINAL" ]]; then
                 ok "Windows Boot Manager is already first in BootOrder."
             else
-                echo "Setting BootOrder to: $FINAL"
+                printf 'Setting BootOrder to: %s\n' "$FINAL"
                 sudo efibootmgr -o "$FINAL"
             fi
         else
-            warn "Could not read current UEFI BootOrder."
+            warn "Could not read the current UEFI BootOrder."
         fi
     else
         warn "Windows Boot Manager not found; leaving BootOrder unchanged."
     fi
 else
-    warn "efibootmgr is not installed; skipping BootOrder adjustment."
+    warn "System is not booted in UEFI mode; skipping BootOrder adjustment."
 fi
 
 ###############################################################################
-# 15. Set Zsh as login shell WITHOUT a second password prompt
+# 16. Set Zsh as login shell
 ###############################################################################
 log "Setting Zsh as the default shell"
 
@@ -403,35 +463,53 @@ CURRENT_LOGIN_SHELL="$(getent passwd "$REAL_USER" | cut -d: -f7)"
 if [[ "$CURRENT_LOGIN_SHELL" == "$ZSH_PATH" ]]; then
     ok "Zsh is already the login shell for $REAL_USER."
 else
-    # chsh asks for the user's password separately. Since sudo is already
-    # authenticated and kept alive, modify the passwd database through
-    # usermod instead. This avoids the second password prompt.
+    # Use the already-authenticated sudo session to avoid a second password
+    # prompt from chsh. usermod updates the same passwd shell field directly.
     sudo usermod -s "$ZSH_PATH" "$REAL_USER"
 
     NEW_LOGIN_SHELL="$(getent passwd "$REAL_USER" | cut -d: -f7)"
-    if [[ "$NEW_LOGIN_SHELL" == "$ZSH_PATH" ]]; then
-        ok "Login shell changed to $ZSH_PATH."
-    else
+    [[ "$NEW_LOGIN_SHELL" == "$ZSH_PATH" ]] || \
         die "Failed to change the login shell for $REAL_USER."
-    fi
+    ok "Login shell changed to $ZSH_PATH."
 fi
+
+###############################################################################
+# 17. Final maintenance
+###############################################################################
+log "Running final maintenance"
+
+# Run autoremove after all package changes so dependency cleanup is based on the
+# final desired package set rather than an intermediate state.
+sudo dnf autoremove -y || warn "dnf autoremove reported a non-fatal issue."
+
+sudo journalctl --vacuum-time=7d || \
+    warn "Journal vacuum reported a non-fatal issue."
+
+if command -v flatpak >/dev/null 2>&1; then
+    flatpak uninstall --unused -y || \
+        warn "Flatpak cleanup reported a non-fatal issue."
+fi
+
+# The weekly timer handles ongoing TRIM; preserve the original immediate trim.
+sudo fstrim -av || warn "Manual fstrim reported a non-fatal issue."
 
 ###############################################################################
 # Complete
 ###############################################################################
-echo
-echo "========================================"
-echo " Fedora KDE setup complete!"
-echo "========================================"
-echo
-echo "User     : $REAL_USER"
-echo "Shell    : $ZSH_PATH"
-echo "Theme    : robbyrussell"
-echo "Plugins  : git, sudo, zsh-autosuggestions,"
-echo "           zsh-syntax-highlighting, zsh-completions"
-echo
-echo "VS Code is configured as the text editor."
-echo "NumLock is configured for KDE/Plasma Login."
-echo
-echo "Log out and log back in, or reboot, for the new login shell."
-echo "========================================"
+printf '\n========================================\n'
+printf ' Fedora KDE setup complete!\n'
+printf '========================================\n\n'
+printf 'User     : %s\n' "$REAL_USER"
+printf 'Fedora   : %s\n' "$FEDORA_VERSION"
+printf 'Shell    : %s\n' "$ZSH_PATH"
+printf 'Theme    : robbyrussell\n'
+printf 'Plugins  : git, sudo, zsh-autosuggestions,\n'
+printf '           zsh-syntax-highlighting, zsh-completions\n\n'
+printf 'VS Code is configured as the text editor.\n'
+printf 'Vivaldi Stable is installed from the official Vivaldi repository.\n'
+printf 'Telegram Desktop and VLC are installed.\n'
+printf 'KDE uses Inter; monospace/terminal font is JetBrains Mono.\n'
+printf 'Full FFmpeg, GStreamer codecs, and AMD VA-API freeworld support are installed.\n'
+printf 'NumLock is configured for KDE/Plasma Login where PLM is available.\n\n'
+printf 'Log out and log back in, or reboot, for the new login shell.\n'
+printf '========================================\n'
