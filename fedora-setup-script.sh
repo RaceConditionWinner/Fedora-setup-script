@@ -151,7 +151,7 @@ sudo dnf install -y \
     zsh git curl util-linux-user \
     libva-utils vulkan-tools efibootmgr \
     rsms-inter-fonts jetbrains-mono-fonts \
-    code vivaldi-stable telegram-desktop vlc
+    code vivaldi-stable telegram-desktop haruna
 
 ###############################################################################
 # 7. Multimedia codecs
