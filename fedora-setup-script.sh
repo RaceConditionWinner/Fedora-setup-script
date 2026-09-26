@@ -148,59 +148,52 @@ log "Installing shell, development, multimedia, and firmware utilities"
 
 # Keep compatible installs in one DNF transaction.
 sudo dnf install -y \
-    zsh git curl util-linux-user \
+    zsh git curl gh util-linux-user \
     libva-utils vulkan-tools efibootmgr \
     rsms-inter-fonts jetbrains-mono-fonts \
     code vivaldi-stable telegram-desktop haruna
 
 ###############################################################################
-# 7. Multimedia codecs
+# 7. GitHub CLI authentication
 ###############################################################################
-log "Installing full multimedia codec support"
+log "Configuring GitHub CLI authentication"
 
-# Fedora ships the restricted ffmpeg-free build. Replace it with RPM Fusion's
-# full FFmpeg build first so the rest of the multimedia stack resolves cleanly.
-if rpm -q ffmpeg >/dev/null 2>&1; then
-    ok "RPM Fusion ffmpeg is already installed."
-elif rpm -q ffmpeg-free >/dev/null 2>&1; then
-    sudo dnf swap -y ffmpeg-free ffmpeg --allowerasing
+if gh auth status >/dev/null 2>&1; then
+    ok "GitHub CLI is already authenticated."
 else
-    sudo dnf install -y ffmpeg
+    printf '\nGitHub CLI authentication is required.\n'
+    printf 'The token will not be echoed and will be passed to gh through stdin.\n\n'
+
+    read -r -s -p "Enter GitHub Personal Access Token: " GITHUB_TOKEN
+    printf '\n'
+
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        unset GITHUB_TOKEN
+        die "No GitHub token was entered."
+    fi
+
+    if printf '%s' "$GITHUB_TOKEN" | gh auth login --with-token; then
+        unset GITHUB_TOKEN
+        ok "GitHub CLI authentication completed."
+    else
+        unset GITHUB_TOKEN
+        die "GitHub CLI authentication failed."
+    fi
 fi
 
-# Install the useful GStreamer/desktop codec stack explicitly. This avoids
-# relying on third-party additions to the Multimedia group, which has had
-# inconsistent behavior with DNF5, while still covering KDE/Qt/GStreamer apps.
-sudo dnf install -y --setopt=install_weak_deps=False \
-    gstreamer1-plugins-good \
-    gstreamer1-plugins-bad-free \
-    gstreamer1-plugins-bad-free-extras \
-    gstreamer1-plugins-bad-freeworld \
-    gstreamer1-plugins-ugly \
-    gstreamer1-plugins-ugly-free \
-    gstreamer1-plugin-libav \
-    gstreamer1-plugin-openh264 \
-    pipewire-codec-aptx \
-    lame-libs
-
 ###############################################################################
-# 8. AMD hardware video acceleration
+# 8. Third-party desktop customizations
 ###############################################################################
-log "Configuring AMD hardware video acceleration"
+log "Installing KDE Windows System Tray"
 
-if rpm -q mesa-va-drivers-freeworld >/dev/null 2>&1; then
-    ok "Mesa VA-API freeworld drivers are already installed."
-elif rpm -q mesa-va-drivers >/dev/null 2>&1; then
-    sudo dnf swap -y mesa-va-drivers mesa-va-drivers-freeworld --allowerasing
-else
-    sudo dnf install -y mesa-va-drivers-freeworld
-fi
+curl -fsSL --retry 3 --retry-delay 2 \
+    https://github.com/RaceConditionWinner/Kde-windows-system-tray/releases/latest/download/install.sh |
+    bash
 
-# Quick sanity checks; these do not alter configuration.
-command -v ffmpeg >/dev/null 2>&1 && ok "FFmpeg is available." || \
-    warn "FFmpeg is unavailable after multimedia setup."
-command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostics are available." || \
-    warn "vainfo is unavailable after multimedia setup."
+log "Installing Vivaldi Swift"
+
+bash <(curl -fsSL --retry 3 --retry-delay 2 \
+    https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.sh)
 
 ###############################################################################
 # 9. Oh My Zsh and plugins
@@ -368,7 +361,7 @@ else
 fi
 
 ###############################################################################
-# 12. KDE/system tweaks
+# 15. KDE/system tweaks
 ###############################################################################
 log "Applying KDE/system tweaks"
 
@@ -394,7 +387,7 @@ sudo systemctl disable NetworkManager-wait-online.service >/dev/null 2>&1 || \
 sudo rm -f -- /etc/xdg/autostart/org.gnome.Software.desktop
 
 ###############################################################################
-# 14. systemd journal limits
+# 16. systemd journal limits
 ###############################################################################
 log "Configuring systemd journal limits"
 
@@ -408,7 +401,7 @@ EOF_JOURNAL
 sudo systemctl restart systemd-journald
 
 ###############################################################################
-# 15. UEFI BootOrder
+# 17. UEFI BootOrder
 ###############################################################################
 log "Checking UEFI boot order"
 
@@ -453,7 +446,7 @@ else
 fi
 
 ###############################################################################
-# 16. Set Zsh as login shell
+# 18. Set Zsh as login shell
 ###############################################################################
 log "Setting Zsh as the default shell"
 
@@ -474,7 +467,7 @@ else
 fi
 
 ###############################################################################
-# 17. Final maintenance
+# 19. Final maintenance
 ###############################################################################
 log "Running final maintenance"
 
@@ -509,7 +502,6 @@ printf 'VS Code is configured as the text editor.\n'
 printf 'Vivaldi Stable is installed from the official Vivaldi repository.\n'
 printf 'Telegram Desktop and VLC are installed.\n'
 printf 'KDE uses Inter; monospace/terminal font is JetBrains Mono.\n'
-printf 'Full FFmpeg, GStreamer codecs, and AMD VA-API freeworld support are installed.\n'
 printf 'NumLock is configured for KDE/Plasma Login where PLM is available.\n\n'
 printf 'Log out and log back in, or reboot, for the new login shell.\n'
 printf '========================================\n'
